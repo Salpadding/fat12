@@ -1,13 +1,30 @@
 interface File {
+    /**
+     * name of the file
+     */
     val name: String
+
+    /**
+     * if file is a directory
+     */
     val isDirectory: Boolean
 
     val isFile: Boolean
         get() = !isDirectory
 
+    /**
+     * read file as byte array
+     */
     fun readAllBytes(): ByteArray
-    val path: String
 
+    /**
+     * absolute path
+     */
+    val absPath: String
+
+    /**
+     * list directory children
+     */
     fun list(): Array<File>
 }
 

@@ -51,7 +51,7 @@ class RootDir(private val fs: Fat12) : File {
     override val isDirectory: Boolean
         get() = true
 
-    override val path: String = "/"
+    override val absPath: String = "/"
 
     override fun readAllBytes(): ByteArray {
         throw UnsupportedOperationException()
@@ -69,7 +69,7 @@ class FileImpl(private val entry: Entry, private val fs: Fat12, private val pref
     override val isDirectory: Boolean
         get() = entry.isDirectory
 
-    override val path: String = "$prefix$name"
+    override val absPath: String = "$prefix$name"
 
     override fun readAllBytes(): ByteArray {
         if (isDirectory)
@@ -79,7 +79,7 @@ class FileImpl(private val entry: Entry, private val fs: Fat12, private val pref
 
     override fun list(): Array<File> {
         val entries = fs.readDirEntries(entry.cluster)
-        return entries.map { FileImpl(it, fs, "$path/") }.toTypedArray()
+        return entries.map { FileImpl(it, fs, "$absPath/") }.toTypedArray()
     }
 }
 
