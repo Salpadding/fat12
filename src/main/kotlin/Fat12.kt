@@ -2,27 +2,20 @@ import org.apache.commons.codec.binary.Hex
 import java.nio.file.Files
 import java.nio.file.Path
 
+@JvmInline
+value class TableEntry(val id: Int) {
+    val unused: Boolean
+        get() = id == 0
 
-/**
- * abstract of file system, unlike windows, path is separated by '/'
- */
-interface FileSystem {
-    // open directory, return the children, currently support only absolute path
-    fun openDir(path: String): Array<String>
+    val reversed: Boolean
+        get() = id >= 0xff0 && id < 0xff7
 
-    // open a regular file
-    fun openFile(path: String): ByteArray
+    val bad: Boolean
+        get() = id == 0xff7
 
-    // save content to file
-    fun write(path: String, content: ByteArray)
-
-    // make a new directory
-    fun mkdir(path: String)
-
-    // return true if regular file found
-    fun isRegular(path: String): Boolean
+    val eoc: Boolean
+        get() = id > 0xff7
 }
-
 
 // structure of boot section
 data class BootSector(
@@ -50,6 +43,45 @@ const val TABLE_BYTES = 9 * SECTION_BYTES
 const val FAT12_BITS = 12
 
 const val MAX_TABLE_SIZE = TABLE_BYTES * 8 / FAT12_BITS
+
+class RootDir(private val fs: Fat12) : File {
+    override val name: String
+        get() = ""
+
+    override val isDirectory: Boolean
+        get() = true
+
+    override val path: String = "/"
+
+    override fun readAllBytes(): ByteArray {
+        throw UnsupportedOperationException()
+    }
+
+    override fun list(): Array<File> {
+        return fs.root.children().map { FileImpl(it, fs, "/") }.toTypedArray()
+    }
+}
+
+class FileImpl(private val entry: Entry, private val fs: Fat12, private val prefix: String) : File {
+    override val name: String
+        get() = entry.fullName
+
+    override val isDirectory: Boolean
+        get() = entry.isDirectory
+
+    override val path: String = "$prefix$name"
+
+    override fun readAllBytes(): ByteArray {
+        if (isDirectory)
+            throw RuntimeException("not a regular file")
+        return fs.readAllBytes(entry.cluster, entry.size)
+    }
+
+    override fun list(): Array<File> {
+        val entries = fs.readDirEntries(entry.cluster)
+        return entries.map { FileImpl(it, fs, "$path/") }.toTypedArray()
+    }
+}
 
 /**
  * directory entry, 32 bytes
@@ -113,22 +145,6 @@ class Table(val fd: FD, val offset: Long) {
         else
             ((buf[0].toUByte().toInt() and 0xf0) ushr 4) or (buf[1].toUByte().toInt() shl 4)
     }
-
-    fun isUnused(value: Int): Boolean {
-        return value == 0
-    }
-
-    fun isReversed(value: Int): Boolean {
-        return value >= 0xff0 && value < 0xff7
-    }
-
-    fun isBad(value: Int): Boolean {
-        return value == 0xff7
-    }
-
-    fun isEnd(value: Int): Boolean {
-        return value >= 0xff8
-    }
 }
 
 class Fat12(val fd: FD) : FileSystem {
@@ -148,51 +164,82 @@ class Fat12(val fd: FD) : FileSystem {
         dataOffset = root.offset + boot.rootEnt * 32
     }
 
+    fun readDirEntries(start: Int): List<Entry> {
+        val maxChildren = SECTION_BYTES / 32
+        fd.seek(dataOffset + (start - 2) * SECTION_BYTES)
 
-    private fun readAllBytes(start: Int, size: Int): ByteArray {
+        val tmp = ByteArray(16)
+
+        val r = mutableListOf<Entry>()
+        for (i in 0 until maxChildren) {
+            val e = fd.readEntry(tmp)
+            if (e.attr == 0)
+                continue
+            r.add(e)
+        }
+        return r
+    }
+
+    fun readAllBytes(start: Int, size: Int): ByteArray {
         val out = ByteArray(size)
 
         // convert logical to physical
-        var cur = start
+        var cur = TableEntry(start)
 
         var read = 0
         val section = ByteArray(SECTION_BYTES)
-        while (!fat1.isEnd(cur) && read < size) {
-            if (fat1.isBad(cur))
+        while (!cur.eoc && read < size) {
+            if (cur.bad)
                 throw RuntimeException("bad cluster found")
-            if (fat1.isReversed(cur)) {
+            if (cur.reversed) {
                 throw RuntimeException("access reversed cluster")
             }
-            if (fat1.isUnused(cur)) {
+            if (cur.unused) {
                 throw RuntimeException("unexpected empty sector")
             }
 
             val toRead = Math.min(size - read, SECTION_BYTES)
 
             // the 0, 1 entry in fat table is reversed
-            fd.seek(dataOffset + (cur - 2) * SECTION_BYTES)
+            fd.seek(dataOffset + (cur.id - 2) * SECTION_BYTES)
             fd.read(section, toRead)
             System.arraycopy(section, 0, out, read, toRead)
             read += toRead
 
             // convert logical to physical
-            cur = fat1[cur]
+            cur = TableEntry(fat1[cur.id])
         }
         return out
     }
 
-    // TODO: openDir
-    override fun openDir(path: String): Array<String> {
-        return emptyArray()
-    }
 
-    override fun openFile(path: String): ByteArray {
-        for (child in root.children()) {
-            if (child.fullName == path) {
-                return readAllBytes(child.cluster, child.size)
+    override fun open(path: String): File? {
+        if (!path.startsWith('/'))
+            throw RuntimeException("please use absolute path")
+        val stack = path.uppercase().trim().split('/').map { it.trim() }
+            .filter { it.isNotEmpty() }
+
+        val fileStack = ArrayDeque<File>()
+        fileStack.addLast(RootDir(this))
+
+        for (i in 0 until stack.size) {
+            val expected = stack[i]
+            if (expected == ".")
+                continue
+            if (expected == "..") {
+                if (!fileStack.isEmpty())
+                    fileStack.removeLast()
+                continue
             }
+            if (!fileStack.last().isDirectory)
+                throw RuntimeException("not a directory")
+
+            val list = fileStack.last().list()
+            val n = list.find { it.name == expected } ?: return null
+            fileStack.addLast(n)
         }
-        throw RuntimeException("file $path not found")
+
+        return fileStack.last()
     }
 
     // TODO: wrtie file
@@ -204,9 +251,6 @@ class Fat12(val fd: FD) : FileSystem {
         TODO("Not yet implemented")
     }
 
-    override fun isRegular(path: String): Boolean {
-        return false
-    }
 }
 
 // parse fat12 image file's boot section
@@ -214,10 +258,6 @@ fun main() {
     val img = System.getenv("IMAGE") ?: return
     val bytes = Files.readAllBytes(Path.of(img))
     val fd = MemoryFD(bytes)
-    val fs = Fat12(fd)
-    println(
-        String(
-            fs.openFile(fs.root.children()[1].fullName)
-        )
-    )
+    val fs: FileSystem = Fat12(fd)
+    println(String(fs.open("/drafts/dos.txt")!!.readAllBytes()))
 }
